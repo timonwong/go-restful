@@ -15,6 +15,12 @@ import (
 	"sync"
 
 	"github.com/emicklei/go-restful/log"
+	"github.com/klauspost/compress/gzhttp"
+)
+
+var (
+	// CompressionMinSize is the minimum size for gzip compression take place.
+	CompressionMinSize = 256
 )
 
 // Container holds a collection of WebServices and a http.ServeMux to dispatch http requests.
@@ -30,6 +36,7 @@ type Container struct {
 	serviceErrorHandleFunc ServiceErrorHandleFunction
 	router                 RouteSelector // default is a CurlyRouter (RouterJSR311 is a slower alternative)
 	contentEncodingEnabled bool          // default is false
+	gzipWrapper            func(http.Handler) http.HandlerFunc
 }
 
 // NewContainer creates a new Container using a new ServeMux and default router (CurlyRouter)
@@ -79,9 +86,37 @@ func (c *Container) Router(aRouter RouteSelector) {
 	c.router = aRouter
 }
 
-// EnableContentEncoding (default=false) allows for GZIP or DEFLATE encoding of responses.
+var allowedContentTypePrefix = []string{
+	"text/",
+	"application/json",
+	"application/javascript",
+	"application/xml",
+}
+
+// compressionContentTypeFilter allows compression for text/* and json & xml content types
+func compressionContentTypeFilter(ct string) bool {
+	for _, prefix := range allowedContentTypePrefix {
+		if strings.HasPrefix(ct, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// EnableContentEncoding (default=false) allows for GZIP encoding of responses.
 func (c *Container) EnableContentEncoding(enabled bool) {
 	c.contentEncodingEnabled = enabled
+	if enabled {
+		gzipWrapper, err := gzhttp.NewWrapper(
+			gzhttp.MinSize(CompressionMinSize),
+			gzhttp.ContentTypeFilter(compressionContentTypeFilter))
+		if err != nil {
+			panic(err)
+		}
+
+		c.gzipWrapper = gzipWrapper
+	}
 }
 
 // Add a WebService to the Container. It will detect duplicate root paths and exit in that case.
@@ -203,13 +238,6 @@ func (c *Container) Dispatch(httpWriter http.ResponseWriter, httpRequest *http.R
 func (c *Container) dispatch(httpWriter http.ResponseWriter, httpRequest *http.Request) {
 	writer := httpWriter
 
-	// CompressingResponseWriter should be closed after all operations are done
-	defer func() {
-		if compressWriter, ok := writer.(*CompressingResponseWriter); ok {
-			compressWriter.Close()
-		}
-	}()
-
 	// Instal panic recovery unless told otherwise
 	if !c.doNotRecover { // catch all for 500 response
 		defer func() {
@@ -231,26 +259,6 @@ func (c *Container) dispatch(httpWriter http.ResponseWriter, httpRequest *http.R
 			c.webServices,
 			httpRequest)
 	}()
-
-	// Detect if compression is needed
-	// assume without compression, test for override
-	contentEncodingEnabled := c.contentEncodingEnabled
-	if route != nil && route.contentEncodingEnabled != nil {
-		contentEncodingEnabled = *route.contentEncodingEnabled
-	}
-	if contentEncodingEnabled {
-		doCompress, encoding := wantsCompressedResponse(httpRequest)
-		if doCompress {
-			var err error
-			writer, err = NewCompressingResponseWriter(httpWriter, encoding)
-			if err != nil {
-				log.Print("unable to install compressor: ", err)
-				httpWriter.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-		}
-	}
-
 	if err != nil {
 		// a non-200 response has already been written
 		// run container filters anyway ; they should not touch the response...
@@ -265,6 +273,7 @@ func (c *Container) dispatch(httpWriter http.ResponseWriter, httpRequest *http.R
 		chain.ProcessFilter(NewRequest(httpRequest), NewResponse(writer))
 		return
 	}
+
 	pathProcessor, routerProcessesPath := c.router.(PathProcessor)
 	if !routerProcessesPath {
 		pathProcessor = defaultPathProcessor{}
@@ -296,8 +305,14 @@ func fixedPrefixPath(pathspec string) string {
 }
 
 // ServeHTTP implements net/http.Handler therefore a Container can be a Handler in a http.Server
-func (c *Container) ServeHTTP(httpwriter http.ResponseWriter, httpRequest *http.Request) {
-	c.ServeMux.ServeHTTP(httpwriter, httpRequest)
+func (c *Container) ServeHTTP(httpWriter http.ResponseWriter, httpRequest *http.Request) {
+	// Skip, if content encoding is disabled
+	if !c.contentEncodingEnabled {
+		c.ServeMux.ServeHTTP(httpWriter, httpRequest)
+		return
+	}
+
+	c.gzipWrapper(c.ServeMux).ServeHTTP(httpWriter, httpRequest)
 }
 
 // Handle registers the handler for the given pattern. If a handler already exists for pattern, Handle panics.
