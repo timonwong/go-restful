@@ -13,10 +13,10 @@ func setupCurly(container *Container) []string {
 	urisCurly := []string{}
 
 	container.Router(CurlyRouter{})
-	for i := 0; i < wsCount; i++ {
+	for i := rune(0); i < rune(wsCount); i++ {
 		root := fmt.Sprintf("/%s/{%s}/", string(i+97), string(i+97))
 		ws := new(WebService).Path(root)
-		for j := 0; j < rtCount; j++ {
+		for j := rune(0); j < rune(rtCount); j++ {
 			sub := fmt.Sprintf("/%s2/{%s2}", string(j+97), string(j+97))
 			ws.Route(ws.GET(sub).Consumes("application/xml").Produces("application/xml").To(echoCurly))
 		}
